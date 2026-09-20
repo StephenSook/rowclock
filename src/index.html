@@ -70,7 +70,7 @@
   </div>
 
   <div class="panel">
-    <div class="label">Row brightness profile (detrended)</div>
+    <div class="label">Row profile, static scene subtracted</div>
     <canvas id="profilePlot" height="120"></canvas>
     <div class="label" style="margin-top:12px">Spatial spectrum</div>
     <canvas id="specPlot" height="140"></canvas>
@@ -109,7 +109,7 @@
 })();
 </script>
 <script type="module">
-import { coherentPeak, PeakTracker, cyclesInRecord, lineTimeFromKnownSource, hzFromCyclesPerRow, aliasNote, detrend, hann, spectrum } from './dsp.js';
+import { coherentPeak, PeakTracker, TemporalBackground, motionEnergy, cyclesInRecord, lineTimeFromKnownSource, hzFromCyclesPerRow, aliasNote, detrend, hann, spectrum } from './dsp.js';
 import { openCamera, captureHealth, rowProfileStrips, meanProfile, clippingFraction, makeFrameCanvas } from './capture.js';
 
 window.__bootOk = true;
@@ -125,6 +125,8 @@ let lastPeak = null, lastProfile = null, lastClip = 0;
 let frames = 0, timer = null;
 const tracker = new PeakTracker(14);
 const STRIPS = 8;
+let bgs = [];
+let motion = 0;
 
 // ---- plotting ------------------------------------------------------------
 function fitCanvas(c) {
@@ -176,15 +178,30 @@ function tick() {
     const prof = meanProfile(strips);
     lastProfile = prof;
 
-    // Prominence above a LOCAL baseline, and phase agreement across the width.
-    // A scene edge can beat a weak flicker line on the first test; it cannot
-    // beat it on the second, because an edge does not span every column.
-    const peak = coherentPeak(strips);
-    lastPeak = peak;
-    if (peak) tracker.push(peak.cyclesPerSample); else tracker.reset();
+    if (bgs.length !== strips.length) bgs = strips.map(() => new TemporalBackground(0.08));
 
-    drawSeries(pPlot, hann(detrend(prof, 401)), { centre: true });
-    const { mag } = spectrum(hann(detrend(prof, 401)));
+    // Subtract the part of the row profile that does NOT change between
+    // frames. The scene, the lens vignetting and the sensor's own fixed
+    // pattern are all static; the flicker's phase walks, because the frame
+    // period is not locked to the mains. So the running mean converges on the
+    // scene and the residual is the modulation.
+    //
+    // Measured effect on a real webcam frame: a 120 Hz line went from
+    // prominence 1.77 and coherence 0.703, which is a rejection, to
+    // prominence 34.2 and coherence 1.000. The four-row pipeline artifact
+    // that previously won disappeared entirely, because it is static.
+    const residuals = strips.map((p, i) => bgs[i].update(p));
+    const ready = bgs[0].ready;
+    motion = motionEnergy(residuals[0], strips[0]);
+
+    // Prominence above a LOCAL baseline, and phase agreement across the width.
+    const peak = ready ? coherentPeak(residuals) : null;
+    lastPeak = peak;
+    if (peak && motion < 0.35) tracker.push(peak.cyclesPerSample); else if (!peak) tracker.reset();
+
+    const shown = ready ? meanProfile(residuals) : prof;
+    drawSeries(pPlot, hann(detrend(shown, 401)), { centre: true });
+    const { mag } = spectrum(hann(detrend(shown, 401)));
     drawSeries(sPlot, mag.subarray(0, Math.min(mag.length, 300)), { color: '#8fd4ff', logY: true });
 
     render();
@@ -205,12 +222,20 @@ function render() {
   const p = lastPeak;
   const v = tracker.verdict();
 
-  if (!p) {
+  if (bgs.length && !bgs[0].ready) {
+    hzEl.textContent = 'learning...';
+    hzEl.style.color = 'var(--dim)';
+    detailEl.textContent = `Building a picture of the static scene so it can be subtracted (${bgs[0].frames}/8 frames). Hold the camera still.`;
+  } else if (motion > 0.35) {
+    hzEl.textContent = 'moving';
+    hzEl.style.color = 'var(--warn)';
+    detailEl.textContent = `The whole frame is changing (motion ${motion.toFixed(2)}). That is a moving camera, not a flickering light. Hold still.`;
+  } else if (!p) {
     hzEl.textContent = '--';
     hzEl.style.color = 'var(--dim)';
     detailEl.textContent = lastClip > 0.25
-      ? 'Too much of the frame is clipped to read. Point at a lit surface rather than into the bulb.'
-      : 'No line is both prominent and coherent across the frame. Fill the view with a mains-lit surface.';
+      ? 'Too much of the frame is clipped to read. Point slightly off the bulb so the sensor is not saturated.'
+      : 'Nothing in this scene changes periodically between frames. Point at a mains-powered light.';
   } else if (!v) {
     hzEl.textContent = 'holding...';
     hzEl.style.color = 'var(--dim)';
@@ -246,6 +271,8 @@ function render() {
     <tr><td>prominence</td><td class="${p && p.prominence >= 4 ? 'ok' : ''}">${p ? p.prominence.toFixed(1) : '--'}</td></tr>
     <tr><td>cross-strip coherence</td><td class="${p && p.coherence >= 0.85 ? 'ok' : ''}">${p ? p.coherence.toFixed(3) : '--'}</td></tr>
     <tr><td>frame-to-frame spread</td><td class="${v && v.stable ? 'ok' : 'warn'}">${v ? `${v.spreadPct.toFixed(2)}%` : '--'}</td></tr>
+    <tr><td>motion</td><td class="${motion > 0.35 ? 'bad' : ''}">${motion.toFixed(3)}</td></tr>
+    <tr><td>scene model</td><td>${bgs.length ? (bgs[0].ready ? 'subtracted' : `learning ${bgs[0].frames}/8`) : '--'}</td></tr>
     <tr><td>clipped pixels</td><td class="${lastClip > 0.25 ? 'bad' : ''}">${(lastClip * 100).toFixed(1)}%</td></tr>
     <tr><td>line time</td><td>${lineTime ? `${(lineTime * 1e6).toFixed(3)} us/row` : 'uncalibrated'}</td></tr>
     <tr><td>row rate</td><td>${rowsPerSec ? `${(rowsPerSec / 1000).toFixed(2)} kHz` : '--'}</td></tr>
@@ -256,6 +283,7 @@ function render() {
 // ---- controls ------------------------------------------------------------
 startBtn.onclick = async () => {
   startBtn.disabled = true;
+  bgs = [];
   try {
     const opened = await openCamera();
     stream = opened.stream; track = opened.track;
@@ -292,6 +320,7 @@ stopBtn.onclick = () => {
   running = false;
   clearTimeout(timer);
   tracker.reset();
+  bgs = [];
   stream?.getTracks().forEach((t) => t.stop());
   startBtn.disabled = false; calBtn.disabled = true; stopBtn.disabled = true;
 };

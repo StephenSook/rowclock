@@ -128,15 +128,26 @@ export function spectrum(x) {
  * that does. Smooth scene structure does not, because its neighbours are just
  * as large.
  */
-export function localBaseline(mag, halfWidth = 24) {
+export function localBaseline(mag, halfWidth = 24, guard = 2) {
   const n = mag.length;
   const base = new Float64Array(n);
   const buf = [];
   for (let k = 0; k < n; k++) {
-    const a = Math.max(0, k - halfWidth);
-    const b = Math.min(n, k + halfWidth + 1);
+    // The window narrows near DC. With a fixed wide window a genuine line at
+    // bin 7 has the whole steep scene hump inside its own baseline, which
+    // inflates the baseline and buries the line. Measured consequence: a real
+    // 120 Hz line at bin ~7 lost to a 4-row pipeline artifact at bin 512.
+    const hw = Math.max(6, Math.min(halfWidth, Math.round(k * 0.6)));
+    const a = Math.max(0, k - hw);
+    const b = Math.min(n, k + hw + 1);
     buf.length = 0;
-    for (let j = a; j < b; j++) buf.push(mag[j]);
+    for (let j = a; j < b; j++) {
+      // A guard band, so a line does not raise the baseline it is measured
+      // against. Without it a strong narrow peak partly hides itself.
+      if (Math.abs(j - k) <= guard) continue;
+      buf.push(mag[j]);
+    }
+    if (!buf.length) { base[k] = mag[k]; continue; }
     buf.sort((p, q) => p - q);
     base[k] = buf[buf.length >> 1];
   }
@@ -283,8 +294,16 @@ export function coherence(strips, bin) {
  * `profiles` is an array of K per-strip row profiles, already the same length.
  * Returns the winning candidate with both scores attached, or null.
  */
-export function coherentPeak(profiles, { loBin = 3, baselineHalfWidth = 24, detrendWin = 401, minCoherence = 0.75 } = {}) {
-  if (!profiles?.length) return null;
+export function coherentCandidates(profiles, {
+  loBin = 3,
+  hiCyclesPerRow = 0.2,
+  baselineHalfWidth = 24,
+  detrendWin = 401,
+  minCoherence = 0.75,
+  minProminence = 2,
+  limit = 6,
+} = {}) {
+  if (!profiles?.length) return [];
 
   const strips = profiles.map((p) => spectrumComplex(hann(detrend(p, detrendWin))));
   const nfft = strips[0].nfft;
@@ -301,34 +320,158 @@ export function coherentPeak(profiles, { loBin = 3, baselineHalfWidth = 24, detr
 
   const base = localBaseline(mean, baselineHalfWidth);
 
-  let best = null;
-  for (let k = loBin; k < half - 1; k++) {
+  // An upper bound in cycles PER ROW, not in hertz, because it is a statement
+  // about the row grid rather than about the world. Above roughly 0.2 cycles
+  // per row a "line" is a pattern repeating every few rows, which is the
+  // signature of the imaging pipeline itself (demosaic, chroma upsampling,
+  // rescaling) and not of a lamp. Measured case: a 4-row period at bin 512
+  // with coherence 0.947 and frame-to-frame spread 0.04 percent, which is
+  // exactly how a FIXED spatial pattern behaves, since it is perfectly stable
+  // and perfectly coherent by construction.
+  const hiBin = Math.min(half - 2, Math.floor(hiCyclesPerRow * nfft));
+
+  const out = [];
+  for (let k = loBin; k < hiBin; k++) {
     if (!(mean[k] >= mean[k - 1] && mean[k] >= mean[k + 1])) continue;
     const prom = mean[k] / (base[k] + 1e-12);
-    if (prom < 2) continue;
+    if (prom < minProminence) continue;
     const coh = coherence(strips, k);
     if (coh < minCoherence) continue;
-    const score = prom * coh;
-    if (!best || score > best.score) best = { k, prom, coh, score };
+
+    const eps = 1e-12;
+    const a = Math.log(mean[k - 1] + eps);
+    const b = Math.log(mean[k] + eps);
+    const c = Math.log(mean[k + 1] + eps);
+    const denom = a - 2 * b + c;
+    const delta = denom === 0 ? 0 : (0.5 * (a - c)) / denom;
+    const refined = k + Math.max(-0.5, Math.min(0.5, delta));
+
+    out.push({
+      bin: refined,
+      cyclesPerSample: refined / nfft,
+      prominence: prom,
+      coherence: coh,
+      score: prom * coh,
+      strips: strips.length,
+      nfft,
+    });
   }
-  if (!best) return null;
 
-  const eps = 1e-12;
-  const a = Math.log(mean[best.k - 1] + eps);
-  const b = Math.log(mean[best.k] + eps);
-  const c = Math.log(mean[best.k + 1] + eps);
-  const denom = a - 2 * b + c;
-  const delta = denom === 0 ? 0 : (0.5 * (a - c)) / denom;
-  const refined = best.k + Math.max(-0.5, Math.min(0.5, delta));
+  out.sort((p, q) => q.score - p.score);
+  return out.slice(0, limit);
+}
 
+/** The single best candidate, or null. */
+export function coherentPeak(profiles, opts = {}) {
+  const c = coherentCandidates(profiles, { ...opts, limit: 1 });
+  return c.length ? c[0] : null;
+}
+
+/**
+ * Decide whether a candidate is a temporal signal or a fixed spatial pattern.
+ *
+ * This is the distinguishing-prediction test, and it is the only honest way to
+ * tell the two apart from inside a browser.
+ *
+ * A TEMPORAL signal at frequency f produces cyclesPerRow = f * lineTime. The
+ * row time depends on the readout mode, so changing the capture resolution
+ * changes lineTime, and therefore changes cyclesPerRow, while f stays put.
+ *
+ * A SPATIAL artifact is locked to the row grid. It repeats every N rows
+ * whatever the resolution, so its cyclesPerRow does not move.
+ *
+ * Measure the same scene at two resolutions and the two hypotheses predict
+ * different things. That is a real experiment, not an assertion, and a reading
+ * that has not passed it should not be presented as a measurement.
+ */
+export function classifyByResolutionSwap(cyclesPerRowA, cyclesPerRowB, { tolPct = 5 } = {}) {
+  if (!(cyclesPerRowA > 0) || !(cyclesPerRowB > 0)) {
+    return { verdict: 'inconclusive', reason: 'one of the two captures produced no stable line' };
+  }
+  const changePct = (Math.abs(cyclesPerRowB - cyclesPerRowA) / cyclesPerRowA) * 100;
+  if (changePct <= tolPct) {
+    return {
+      verdict: 'spatial',
+      changePct,
+      reason: `cycles per row barely moved (${changePct.toFixed(1)}%) when the row grid changed. This is locked to the sensor grid, so it is a pipeline artifact, not a light.`,
+    };
+  }
   return {
-    bin: refined,
-    cyclesPerSample: refined / nfft,
-    prominence: best.prom,
-    coherence: best.coh,
-    score: best.score,
-    strips: strips.length,
+    verdict: 'temporal',
+    changePct,
+    reason: `cycles per row moved ${changePct.toFixed(1)}% with the row time, which is what a real temporal signal does and a fixed pattern cannot.`,
   };
+}
+
+/**
+ * Running mean of the row profile, which IS the static scene.
+ *
+ * This is the move that makes the instrument work, and it took two real camera
+ * runs to find. The diagnostic that produced it: a genuine 120 Hz line scored
+ * prominence 1.77 and coherence 0.703, both below bar, because with only about
+ * three and a half cycles across 1080 rows the line is intrinsically four bins
+ * wide and sits on top of strong scene energy. Tuning thresholds cannot
+ * separate them; they overlap in frequency.
+ *
+ * What separates them is TIME, not frequency:
+ *
+ *   - The scene is static. A wall, an edge, vignetting and the sensor's own
+ *     fixed pattern produce the same row profile every frame, with the same
+ *     phase.
+ *   - Flicker is not. The frame period is not locked to the mains, so the
+ *     banding sits in a different place each frame and its phase walks.
+ *
+ * So the running mean converges on the scene and the flicker averages itself
+ * away. Subtract it, and what remains is the part of the image that MOVES.
+ * That removes the gradient, the edges, the vignetting, and, for free, the
+ * four-row pipeline artifact that nearly became our headline number, because
+ * a fixed pattern is static by definition.
+ *
+ * Camera motion breaks the static assumption, which is why motionEnergy() is
+ * published alongside the reading rather than hidden.
+ */
+export class TemporalBackground {
+  constructor(alpha = 0.06) {
+    this.alpha = alpha;   // exponential forgetting factor
+    this.mean = null;
+    this.frames = 0;
+  }
+
+  reset() { this.mean = null; this.frames = 0; }
+
+  /** Update with a new profile and return the residual (profile minus scene). */
+  update(profile) {
+    const n = profile.length;
+    if (!this.mean || this.mean.length !== n) {
+      this.mean = Float64Array.from(profile);
+      this.frames = 1;
+      return new Float64Array(n); // nothing to say from a single frame
+    }
+    const a = this.alpha;
+    const resid = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      resid[i] = profile[i] - this.mean[i];
+      this.mean[i] = (1 - a) * this.mean[i] + a * profile[i];
+    }
+    this.frames++;
+    return resid;
+  }
+
+  /** True once the running mean has seen enough frames to be a scene estimate. */
+  get ready() { return this.frames >= 8; }
+}
+
+/**
+ * How much of the residual is bulk movement rather than modulation.
+ *
+ * If the camera is being waved around, every row changes and the residual is
+ * large and broadband. A reading taken then is not measuring a lamp, it is
+ * measuring a shaky hand, and the page says so instead of printing a number.
+ */
+export function motionEnergy(residual, profile) {
+  let rs = 0, ps = 0;
+  for (let i = 0; i < residual.length; i++) { rs += residual[i] * residual[i]; ps += profile[i] * profile[i]; }
+  return ps > 0 ? Math.sqrt(rs / ps) : 0;
 }
 
 /**
