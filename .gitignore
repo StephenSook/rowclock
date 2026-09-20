@@ -1,0 +1,12 @@
+# private working material, never publish
+_recon/
+_private/
+*.mov
+*.mp4.orig
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.env
+.env.local
