@@ -48,6 +48,22 @@ export function fft(re, im) {
   }
 }
 
+/**
+ * Inverse FFT, in place, by conjugation.
+ *
+ * ifft(X) = conj(fft(conj(X))) / n. Reusing the forward transform means there
+ * is one butterfly implementation to get right and to test, rather than two.
+ */
+export function ifft(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) {
+    re[i] /= n;
+    im[i] = -im[i] / n;
+  }
+}
+
 /** Next power of two >= n. */
 export function nextPow2(n) {
   let p = 1;
