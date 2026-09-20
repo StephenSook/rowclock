@@ -404,6 +404,69 @@ export function classifyByResolutionSwap(cyclesPerRowA, cyclesPerRowB, { tolPct 
 }
 
 /**
+ * Reconstruct the sinusoid the detected bin actually represents, and report
+ * how much of the signal it explains.
+ *
+ * This exists because every confidence number we display can be fooled by the
+ * same thing. A genuine 120 Hz banding pattern and a single drifting
+ * horizontal edge both span the full width, so both score high coherence;
+ * both are stable frame to frame; and an isolated bump roughly one sixth of
+ * the frame tall puts its spectral peak near bin 6 for reasons that have
+ * nothing to do with a lamp. Observed on a real ceiling: bin 6.37, coherence
+ * 0.970, spread 1.31 percent, and a row profile showing ONE bump rather than
+ * the three ripples that frequency demands.
+ *
+ * A number cannot settle that. Drawing the fitted wave over the data can: if
+ * the line is real the wave tracks the whole trace, and if it is a lump the
+ * wave oscillates through flat regions where nothing is happening.
+ *
+ * Returns the reconstruction plus fitFraction, the share of the signal's
+ * energy the single sinusoid accounts for. A periodic line explains most of
+ * it; a localized bump explains very little, because its energy is spread
+ * across many bins.
+ */
+export function fitSinusoid(signal, bin, nfft) {
+  const n = signal.length;
+  const w = (2 * Math.PI * bin) / nfft;
+
+  // Least squares at the EXACT frequency, not the value of one rounded FFT
+  // bin. The detected bin is deliberately fractional, and a fractional tone
+  // leaks across neighbours, so a single bin's magnitude understates the
+  // amplitude badly: a pure line fitted that way explained only 65 percent of
+  // its own energy. Projecting onto cos and sin at the true frequency is
+  // exact, costs one pass, and does not care about zero padding.
+  let cc = 0, ss = 0, cs = 0, xc = 0, xs = 0;
+  for (let i = 0; i < n; i++) {
+    const c = Math.cos(w * i);
+    const s = Math.sin(w * i);
+    cc += c * c; ss += s * s; cs += c * s;
+    xc += signal[i] * c; xs += signal[i] * s;
+  }
+  const det = cc * ss - cs * cs;
+  if (Math.abs(det) < 1e-12) {
+    return { fitted: new Float64Array(n), amplitude: 0, phase: 0, fitFraction: 0 };
+  }
+  const A = (xc * ss - xs * cs) / det;
+  const B = (xs * cc - xc * cs) / det;
+
+  const amp = Math.hypot(A, B);
+  const phase = Math.atan2(-B, A);
+
+  const fitted = new Float64Array(n);
+  for (let i = 0; i < n; i++) fitted[i] = A * Math.cos(w * i) + B * Math.sin(w * i);
+
+  let sigE = 0, resE = 0;
+  for (let i = 0; i < n; i++) {
+    sigE += signal[i] * signal[i];
+    const d = signal[i] - fitted[i];
+    resE += d * d;
+  }
+  const fitFraction = sigE > 0 ? Math.max(0, 1 - resE / sigE) : 0;
+
+  return { fitted, amplitude: amp, phase, fitFraction };
+}
+
+/**
  * Running mean of the row profile, which IS the static scene.
  *
  * This is the move that makes the instrument work, and it took two real camera

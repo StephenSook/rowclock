@@ -22,6 +22,7 @@ import {
   classifyByResolutionSwap,
   TemporalBackground,
   motionEnergy,
+  fitSinusoid,
   cyclesInRecord,
   prominentPeak,
   detrendWindowFor,
@@ -629,4 +630,64 @@ test('localBaseline guard band stops a line from hiding inside its own baseline'
   const unguarded = localBaseline(mag, 24, 0);
   assert.ok(guarded[200] <= unguarded[200], 'the guard band must not raise the baseline');
   assert.ok(mag[200] / guarded[200] > 20, `prominence collapsed to ${(mag[200] / guarded[200]).toFixed(1)}`);
+});
+
+// ---------------------------------------------------------------------------
+// THIRD REAL-CAMERA FINDING, 2026-09-19. Pointed at a lit ceiling the
+// instrument reported bin 6.37, coherence 0.970 and frame-to-frame spread
+// 1.31 percent, which is physically consistent with 120 Hz at 25.5 us/row.
+// But the row profile showed ONE bump, not the 3.3 ripples that frequency
+// requires. Every confidence number we display is blind to that difference,
+// so this is the test that separates them.
+// ---------------------------------------------------------------------------
+
+test('fitFraction is high for a genuine periodic line', () => {
+  const n = 1080;
+  const nfft = nextPow2(n);
+  const bin = 6.37;
+  const x = new Float64Array(n);
+  for (let i = 0; i < n; i++) x[i] = 5 * Math.cos((2 * Math.PI * bin * i) / nfft + 0.4);
+
+  const f = fitSinusoid(x, bin, nfft);
+  assert.ok(f.fitFraction > 0.9, `a pure line only explained ${(f.fitFraction * 100).toFixed(0)}%`);
+  assert.ok(Math.abs(f.amplitude - 5) / 5 < 0.25, `amplitude off: ${f.amplitude.toFixed(2)}`);
+});
+
+test('KEY DISCRIMINATOR: fitFraction is low for a single localized bump', () => {
+  // An isolated excursion about a sixth of the frame tall, centred, flat
+  // elsewhere. Its spectrum peaks near bin 6 exactly like the real case, so
+  // bin position alone cannot tell them apart.
+  const n = 1080;
+  const nfft = nextPow2(n);
+  const x = new Float64Array(n);
+  const c = n * 0.62, w = n / 12;
+  for (let i = 0; i < n; i++) {
+    const z = (i - c) / w;
+    x[i] = 5 * z * Math.exp(-0.5 * z * z);   // one bump then one dip
+  }
+
+  const peak = analyseProfile(x);
+  assert.ok(peak, 'the bump should still produce a spectral peak, which is the problem');
+  const f = fitSinusoid(x, peak.bin, nextPow2(n));
+  assert.ok(
+    f.fitFraction < 0.5,
+    `a localized bump was explained ${(f.fitFraction * 100).toFixed(0)}% by one sinusoid; it must not be`,
+  );
+});
+
+test('the two cases are separable by fitFraction even at the same bin', () => {
+  const n = 1080;
+  const nfft = nextPow2(n);
+  const bin = 6.37;
+
+  const line = new Float64Array(n);
+  for (let i = 0; i < n; i++) line[i] = 5 * Math.cos((2 * Math.PI * bin * i) / nfft);
+
+  const bump = new Float64Array(n);
+  const c = n * 0.62, w = n / 12;
+  for (let i = 0; i < n; i++) { const z = (i - c) / w; bump[i] = 5 * z * Math.exp(-0.5 * z * z); }
+
+  const fLine = fitSinusoid(line, bin, nfft).fitFraction;
+  const fBump = fitSinusoid(bump, bin, nfft).fitFraction;
+  assert.ok(fLine - fBump > 0.4, `separation too small: line ${fLine.toFixed(2)} vs bump ${fBump.toFixed(2)}`);
 });

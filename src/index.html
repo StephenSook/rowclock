@@ -70,7 +70,7 @@
   </div>
 
   <div class="panel">
-    <div class="label">Row profile, static scene subtracted</div>
+    <div class="label">Row profile, static scene subtracted <span style="color:#ff8ad4;text-transform:none;letter-spacing:0">(pink = the fitted wave)</span></div>
     <canvas id="profilePlot" height="120"></canvas>
     <div class="label" style="margin-top:12px">Spatial spectrum</div>
     <canvas id="specPlot" height="140"></canvas>
@@ -109,7 +109,7 @@
 })();
 </script>
 <script type="module">
-import { coherentPeak, PeakTracker, TemporalBackground, motionEnergy, cyclesInRecord, lineTimeFromKnownSource, hzFromCyclesPerRow, aliasNote, detrend, hann, spectrum } from './dsp.js';
+import { coherentPeak, PeakTracker, TemporalBackground, motionEnergy, fitSinusoid, nextPow2, cyclesInRecord, lineTimeFromKnownSource, hzFromCyclesPerRow, aliasNote, detrend, hann, spectrum } from './dsp.js';
 import { openCamera, captureHealth, rowProfileStrips, meanProfile, clippingFraction, makeFrameCanvas } from './capture.js';
 
 window.__bootOk = true;
@@ -127,6 +127,7 @@ const tracker = new PeakTracker(14);
 const STRIPS = 8;
 let bgs = [];
 let motion = 0;
+let lastFit = null;
 
 // ---- plotting ------------------------------------------------------------
 function fitCanvas(c) {
@@ -141,7 +142,7 @@ function fitCanvas(c) {
   return { ctx, w, h: c.clientHeight };
 }
 
-function drawSeries(canvas, data, { color = '#7cf5a0', centre = false, logY = false } = {}) {
+function drawSeries(canvas, data, { color = '#7cf5a0', centre = false, logY = false, overlay = null, overlayColor = '#ff8ad4' } = {}) {
   const { ctx, w, h } = fitCanvas(canvas);
   ctx.clearRect(0, 0, w, h);
   if (!data || !data.length) return;
@@ -156,15 +157,24 @@ function drawSeries(canvas, data, { color = '#7cf5a0', centre = false, logY = fa
     ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
   }
 
-  ctx.strokeStyle = color; ctx.lineWidth = 1.25; ctx.beginPath();
-  const n = data.length;
-  for (let i = 0; i < n; i++) {
-    const v = logY ? Math.log10(data[i] + 1e-9) : data[i];
-    const x = (i / (n - 1)) * w;
-    const y = h - ((v - lo) / (hi - lo)) * h;
-    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-  }
-  ctx.stroke();
+  const plot = (series, stroke, width) => {
+    ctx.strokeStyle = stroke; ctx.lineWidth = width; ctx.beginPath();
+    const n = series.length;
+    for (let i = 0; i < n; i++) {
+      const v = logY ? Math.log10(series[i] + 1e-9) : series[i];
+      const x = (i / (n - 1)) * w;
+      const y = h - ((v - lo) / (hi - lo)) * h;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  };
+
+  plot(data, color, 1.25);
+  // The fitted wave, drawn over the data. If the detected line is real the
+  // wave tracks the whole trace; if it is one localized lump the wave
+  // oscillates through flat regions where nothing is happening, and the
+  // mismatch is visible instantly without reading a single number.
+  if (overlay && overlay.length === data.length) plot(overlay, overlayColor, 1.6);
 }
 
 // ---- main loop -----------------------------------------------------------
@@ -197,11 +207,18 @@ function tick() {
     // Prominence above a LOCAL baseline, and phase agreement across the width.
     const peak = ready ? coherentPeak(residuals) : null;
     lastPeak = peak;
-    if (peak && motion < 0.35) tracker.push(peak.cyclesPerSample); else if (!peak) tracker.reset();
+    const fitOk = lastFit && lastFit.fitFraction >= 0.5;
+    if (peak && fitOk && motion < 0.35) tracker.push(peak.cyclesPerSample);
+    else if (!peak) tracker.reset();
 
     const shown = ready ? meanProfile(residuals) : prof;
-    drawSeries(pPlot, hann(detrend(shown, 401)), { centre: true });
-    const { mag } = spectrum(hann(detrend(shown, 401)));
+    const prepped = hann(detrend(shown, 401));
+
+    // Does one sinusoid at the detected frequency actually explain this trace?
+    lastFit = peak ? fitSinusoid(prepped, peak.bin, nextPow2(prepped.length)) : null;
+
+    drawSeries(pPlot, prepped, { centre: true, overlay: lastFit ? lastFit.fitted : null });
+    const { mag } = spectrum(Float64Array.from(prepped));
     drawSeries(sPlot, mag.subarray(0, Math.min(mag.length, 300)), { color: '#8fd4ff', logY: true });
 
     render();
@@ -236,6 +253,10 @@ function render() {
     detailEl.textContent = lastClip > 0.25
       ? 'Too much of the frame is clipped to read. Point slightly off the bulb so the sensor is not saturated.'
       : 'Nothing in this scene changes periodically between frames. Point at a mains-powered light.';
+  } else if (lastFit && lastFit.fitFraction < 0.5) {
+    hzEl.textContent = 'not periodic';
+    hzEl.style.color = 'var(--warn)';
+    detailEl.textContent = `A line was found at bin ${p.bin.toFixed(1)}, but one wave at that frequency explains only ${(lastFit.fitFraction * 100).toFixed(0)}% of the trace. That is a single bump, not banding. The pink overlay shows the mismatch.`;
   } else if (!v) {
     hzEl.textContent = 'holding...';
     hzEl.style.color = 'var(--dim)';
@@ -270,6 +291,7 @@ function render() {
     <tr><td>cycles in record</td><td>${v ? cyclesInRecord(v.median, rows).toFixed(1) : '--'}</td></tr>
     <tr><td>prominence</td><td class="${p && p.prominence >= 4 ? 'ok' : ''}">${p ? p.prominence.toFixed(1) : '--'}</td></tr>
     <tr><td>cross-strip coherence</td><td class="${p && p.coherence >= 0.85 ? 'ok' : ''}">${p ? p.coherence.toFixed(3) : '--'}</td></tr>
+    <tr><td>explained by one wave</td><td class="${lastFit && lastFit.fitFraction >= 0.5 ? 'ok' : 'warn'}">${lastFit ? `${(lastFit.fitFraction * 100).toFixed(0)}%` : '--'}</td></tr>
     <tr><td>frame-to-frame spread</td><td class="${v && v.stable ? 'ok' : 'warn'}">${v ? `${v.spreadPct.toFixed(2)}%` : '--'}</td></tr>
     <tr><td>motion</td><td class="${motion > 0.35 ? 'bad' : ''}">${motion.toFixed(3)}</td></tr>
     <tr><td>scene model</td><td>${bgs.length ? (bgs[0].ready ? 'subtracted' : `learning ${bgs[0].frames}/8`) : '--'}</td></tr>
