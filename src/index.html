@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rowclock</title>
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --line: #232a32;
+    --ink: #e8edf2; --dim: #8d99a6; --accent: #7cf5a0; --warn: #ffb35c; --bad: #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    padding: 16px; padding-bottom: 48px;
+  }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 16px; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; margin-bottom: 12px;
+  }
+  button {
+    background: var(--accent); color: #07240f; border: 0; border-radius: 7px;
+    padding: 10px 16px; font-weight: 650; font-size: 14px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  canvas { width: 100%; display: block; background: #0e1216; border-radius: 6px; }
+  video { width: 160px; border-radius: 6px; background: #000; }
+  .readout { font-family: var(--mono); font-size: 13px; }
+  .big { font-family: var(--mono); font-size: 34px; font-weight: 700; letter-spacing: -0.02em; }
+  .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+  .warn { color: var(--warn); font-size: 13px; }
+  .bad { color: var(--bad); font-size: 13px; }
+  .ok { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  td { padding: 3px 0; }
+  td:first-child { color: var(--dim); width: 45%; }
+  @media (max-width: 520px) { body { padding: 12px; } .big { font-size: 28px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>rowclock</h1>
+  <p class="sub">
+    A CMOS sensor reads one row at a time, so a single frame is a time series, not a snapshot.
+    This page treats the rows as samples and reads frequencies far above the frame rate.
+  </p>
+
+  <div class="panel">
+    <div class="row">
+      <button id="start">Start camera</button>
+      <button id="calibrate" class="ghost" disabled>Calibrate on a mains lamp</button>
+      <button id="stop" class="ghost" disabled>Stop</button>
+      <video id="preview" playsinline muted autoplay></video>
+    </div>
+    <div id="health" style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Reading</div>
+    <div class="big" id="hz">--</div>
+    <div class="readout" id="detail" style="color:var(--dim)">Start the camera and point it at a light source.</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Row brightness profile (detrended)</div>
+    <canvas id="profilePlot" height="120"></canvas>
+    <div class="label" style="margin-top:12px">Spatial spectrum</div>
+    <canvas id="specPlot" height="140"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="label">State</div>
+    <table id="state"></table>
+  </div>
+
+</div>
+
+<div id="boot" class="panel" style="display:none"></div>
+<script>
+// Classic script, loaded BEFORE the module, so that a module parse error or a
+// failed import is visible to the person using the page instead of being
+// swallowed into a devtools console they are not looking at. A judge on an
+// unfamiliar machine should be told why the camera did not open.
+(function () {
+  const show = (kind, msg) => {
+    const el = document.getElementById('boot');
+    if (!el) return;
+    el.style.display = 'block';
+    el.innerHTML += '<div class="bad">' + kind + ': ' + msg + '</div>';
+  };
+  window.addEventListener('error', (e) => {
+    show('Load error', (e.message || 'unknown') + (e.filename ? ' [' + e.filename.split('/').pop() + ':' + e.lineno + ']' : ''));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    show('Unhandled rejection', (e.reason && (e.reason.message || e.reason)) || 'unknown');
+  });
+  window.__bootOk = false;
+  setTimeout(() => {
+    if (!window.__bootOk) show('Startup', 'The page script never finished loading. Check that dsp.js and capture.js are being served next to index.html.');
+  }, 3000);
+})();
+</script>
+<script type="module">
+import { coherentPeak, PeakTracker, cyclesInRecord, lineTimeFromKnownSource, hzFromCyclesPerRow, aliasNote, detrend, hann, spectrum } from './dsp.js';
+import { openCamera, captureHealth, rowProfileStrips, meanProfile, clippingFraction, makeFrameCanvas } from './capture.js';
+
+window.__bootOk = true;
+const $ = (id) => document.getElementById(id);
+const startBtn = $('start'), calBtn = $('calibrate'), stopBtn = $('stop');
+const preview = $('preview'), healthEl = $('health');
+const hzEl = $('hz'), detailEl = $('detail'), stateEl = $('state');
+const pPlot = $('profilePlot'), sPlot = $('specPlot');
+
+let track = null, stream = null, frame = null, running = false;
+let lineTime = null;          // seconds per row, once calibrated
+let lastPeak = null, lastProfile = null, lastClip = 0;
+let frames = 0, timer = null;
+const tracker = new PeakTracker(14);
+const STRIPS = 8;
+
+// ---- plotting ------------------------------------------------------------
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth;
+  if (c.width !== Math.round(w * dpr)) {
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(c.clientHeight * dpr);
+  }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h: c.clientHeight };
+}
+
+function drawSeries(canvas, data, { color = '#7cf5a0', centre = false, logY = false } = {}) {
+  const { ctx, w, h } = fitCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  if (!data || !data.length) return;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const v of data) { const y = logY ? Math.log10(v + 1e-9) : v; if (y < lo) lo = y; if (y > hi) hi = y; }
+  if (centre) { const m = Math.max(Math.abs(lo), Math.abs(hi)); lo = -m; hi = m; }
+  if (hi - lo < 1e-12) { hi = lo + 1; }
+
+  if (centre) {
+    ctx.strokeStyle = '#232a32'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+  }
+
+  ctx.strokeStyle = color; ctx.lineWidth = 1.25; ctx.beginPath();
+  const n = data.length;
+  for (let i = 0; i < n; i++) {
+    const v = logY ? Math.log10(data[i] + 1e-9) : data[i];
+    const x = (i / (n - 1)) * w;
+    const y = h - ((v - lo) / (hi - lo)) * h;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// ---- main loop -----------------------------------------------------------
+function tick() {
+  if (!running) return;
+  try {
+    frame.ctx.drawImage(preview, 0, 0, frame.width, frame.height);
+    lastClip = clippingFraction(frame.ctx, frame.width, frame.height);
+
+    const strips = rowProfileStrips(frame.ctx, frame.width, frame.height, STRIPS);
+    const prof = meanProfile(strips);
+    lastProfile = prof;
+
+    // Prominence above a LOCAL baseline, and phase agreement across the width.
+    // A scene edge can beat a weak flicker line on the first test; it cannot
+    // beat it on the second, because an edge does not span every column.
+    const peak = coherentPeak(strips);
+    lastPeak = peak;
+    if (peak) tracker.push(peak.cyclesPerSample); else tracker.reset();
+
+    drawSeries(pPlot, hann(detrend(prof, 401)), { centre: true });
+    const { mag } = spectrum(hann(detrend(prof, 401)));
+    drawSeries(sPlot, mag.subarray(0, Math.min(mag.length, 300)), { color: '#8fd4ff', logY: true });
+
+    render();
+    frames++;
+  } catch (err) {
+    detailEl.textContent = `Frame error: ${err.message}`;
+  }
+  // A timer, not requestAnimationFrame. We are sampling a camera, not
+  // animating to vsync, and rAF is suspended entirely while the tab is in the
+  // background, which silently stops the instrument rather than pausing it
+  // visibly. A timer keeps running (throttled) and the frame counter below
+  // makes a stall observable instead of mysterious.
+  timer = setTimeout(tick, 33);
+}
+
+function render() {
+  const rows = frame ? frame.height : 0;
+  const p = lastPeak;
+  const v = tracker.verdict();
+
+  if (!p) {
+    hzEl.textContent = '--';
+    hzEl.style.color = 'var(--dim)';
+    detailEl.textContent = lastClip > 0.25
+      ? 'Too much of the frame is clipped to read. Point at a lit surface rather than into the bulb.'
+      : 'No line is both prominent and coherent across the frame. Fill the view with a mains-lit surface.';
+  } else if (!v) {
+    hzEl.textContent = 'holding...';
+    hzEl.style.color = 'var(--dim)';
+    detailEl.textContent = `Found a candidate. Waiting for it to repeat across frames before trusting it (${tracker.samples.length}/6).`;
+  } else if (!v.stable) {
+    hzEl.textContent = 'unstable';
+    hzEl.style.color = 'var(--warn)';
+    detailEl.textContent = `The estimate is jumping by ${v.spreadPct.toFixed(1)}% between frames. Hold the camera still, or there is no real periodic source here.`;
+  } else if (lineTime) {
+    const hz = hzFromCyclesPerRow(v.median, lineTime);
+    const cyc = cyclesInRecord(v.median, rows);
+    hzEl.textContent = `${hz.toFixed(1)} Hz`;
+    hzEl.style.color = 'var(--accent)';
+    const a = aliasNote(hz, lineTime);
+    const cycNote = cyc < 4
+      ? ` Only ${cyc.toFixed(1)} cycles in the record, so treat this as approximate.`
+      : '';
+    detailEl.textContent = (a.unambiguous
+      ? `Stable to ${v.spreadPct.toFixed(2)}% over ${v.n} frames. Fold point ${(a.nyquistHz / 1000).toFixed(1)} kHz.`
+      : `ABOVE THE FOLD POINT. Ambiguous with ${a.aliases.map((f) => f.toFixed(0)).join(' and ')} Hz.`) + cycNote;
+  } else {
+    hzEl.textContent = `${(v.median * 1000).toFixed(3)} mc/row`;
+    hzEl.style.color = 'var(--warn)';
+    detailEl.textContent = `Stable to ${v.spreadPct.toFixed(2)}% over ${v.n} frames. Point at a mains lamp and press Calibrate to turn this into hertz.`;
+  }
+
+  const rowsPerSec = lineTime ? 1 / lineTime : null;
+  stateEl.innerHTML = `
+    <tr><td>frame</td><td>${frame ? `${frame.width} x ${frame.height}` : '--'} (${rows} rows, ${STRIPS} strips)</td></tr>
+    <tr><td>peak</td><td>${p ? `bin ${p.bin.toFixed(2)}` : '--'}</td></tr>
+    <tr><td>cycles / row</td><td>${v ? v.median.toExponential(4) : (p ? p.cyclesPerSample.toExponential(4) : '--')}</td></tr>
+    <tr><td>cycles in record</td><td>${v ? cyclesInRecord(v.median, rows).toFixed(1) : '--'}</td></tr>
+    <tr><td>prominence</td><td class="${p && p.prominence >= 4 ? 'ok' : ''}">${p ? p.prominence.toFixed(1) : '--'}</td></tr>
+    <tr><td>cross-strip coherence</td><td class="${p && p.coherence >= 0.85 ? 'ok' : ''}">${p ? p.coherence.toFixed(3) : '--'}</td></tr>
+    <tr><td>frame-to-frame spread</td><td class="${v && v.stable ? 'ok' : 'warn'}">${v ? `${v.spreadPct.toFixed(2)}%` : '--'}</td></tr>
+    <tr><td>clipped pixels</td><td class="${lastClip > 0.25 ? 'bad' : ''}">${(lastClip * 100).toFixed(1)}%</td></tr>
+    <tr><td>line time</td><td>${lineTime ? `${(lineTime * 1e6).toFixed(3)} us/row` : 'uncalibrated'}</td></tr>
+    <tr><td>row rate</td><td>${rowsPerSec ? `${(rowsPerSec / 1000).toFixed(2)} kHz` : '--'}</td></tr>
+    <tr><td>frames analysed</td><td>${frames}</td></tr>
+  `;
+}
+
+// ---- controls ------------------------------------------------------------
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  try {
+    const opened = await openCamera();
+    stream = opened.stream; track = opened.track;
+    preview.srcObject = stream;
+    await preview.play();
+    frame = makeFrameCanvas(track);
+
+    const h = captureHealth(track);
+    healthEl.innerHTML = h.warnings.length
+      ? h.warnings.map((w) => `<div class="warn">! ${w}</div>`).join('')
+      : '<div class="ok" style="font-size:13px">Capture path clean: manual exposure held and no anti-banding reported.</div>';
+
+    running = true;
+    frames = 0;
+    calBtn.disabled = false; stopBtn.disabled = false;
+    tick();
+  } catch (err) {
+    startBtn.disabled = false;
+    healthEl.innerHTML = `<div class="bad">Could not open the camera: ${err.message}</div>`;
+  }
+};
+
+calBtn.onclick = () => {
+  const v = tracker.verdict();
+  if (!v || !v.stable) {
+    healthEl.innerHTML = '<div class="bad">Refusing to calibrate on an unstable reading. Fill the frame with a mains-lit surface and wait for the spread to settle below 2 percent.</div>';
+    return;
+  }
+  lineTime = lineTimeFromKnownSource(v.median, 120);
+  healthEl.innerHTML = `<div class="ok" style="font-size:13px">Calibrated against an assumed 120 Hz source. Row time ${(lineTime * 1e6).toFixed(3)} us, row rate ${(1 / lineTime / 1000).toFixed(2)} kHz.</div>`;
+};
+
+stopBtn.onclick = () => {
+  running = false;
+  clearTimeout(timer);
+  tracker.reset();
+  stream?.getTracks().forEach((t) => t.stop());
+  startBtn.disabled = false; calBtn.disabled = true; stopBtn.disabled = true;
+};
+</script>
+</body>
+</html>

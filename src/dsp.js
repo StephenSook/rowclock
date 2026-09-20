@@ -114,6 +114,36 @@ export function spectrum(x) {
 }
 
 /**
+ * Running-median baseline of a spectrum.
+ *
+ * This exists because comparing a peak to the GLOBAL median is not a test of
+ * anything. A real scene's row profile is dominated by low spatial frequency
+ * (a bright ceiling, a dark desk, a horizon line), so the low bins tower over
+ * the high-bin noise floor and the global ratio comes out enormous no matter
+ * what the camera is pointed at. Measured on a blank wall it read 394.7, which
+ * looks like overwhelming confidence and means nothing.
+ *
+ * A LOCAL baseline asks the only question that matters: does this bin stand
+ * above its own neighbourhood. A periodic source produces an isolated line
+ * that does. Smooth scene structure does not, because its neighbours are just
+ * as large.
+ */
+export function localBaseline(mag, halfWidth = 24) {
+  const n = mag.length;
+  const base = new Float64Array(n);
+  const buf = [];
+  for (let k = 0; k < n; k++) {
+    const a = Math.max(0, k - halfWidth);
+    const b = Math.min(n, k + halfWidth + 1);
+    buf.length = 0;
+    for (let j = a; j < b; j++) buf.push(mag[j]);
+    buf.sort((p, q) => p - q);
+    base[k] = buf[buf.length >> 1];
+  }
+  return base;
+}
+
+/**
  * Locate the dominant peak and refine it to sub-bin precision.
  *
  * Quadratic interpolation over the log-magnitudes of the peak bin and its two
@@ -159,14 +189,229 @@ export function dominantPeak(mag, nfft, loBin = 4) {
 }
 
 /**
- * The whole pipeline for one profile: detrend, window, transform, pick the peak.
- * `profile` is a per-row (or per-sample) series. Returns the peak, or null.
+ * Find the most PROMINENT line in the spectrum, not merely the tallest bin.
+ *
+ * Prominence is magnitude divided by the local baseline. An isolated periodic
+ * line scores high; the shoulder of a broad scene-content hump scores near 1
+ * however tall it is in absolute terms. This is the honest confidence number
+ * and it is what gates whether a reading is shown at all.
  */
-export function analyseProfile(profile, { detrendWin = 65, loBin = 4 } = {}) {
+export function prominentPeak(mag, nfft, { loBin = 3, baselineHalfWidth = 24 } = {}) {
+  const n = mag.length;
+  if (loBin >= n - 1) return null;
+  const base = localBaseline(mag, baselineHalfWidth);
+
+  let best = -1;
+  let bestRatio = 0;
+  for (let k = loBin; k < n - 1; k++) {
+    // Only consider actual local maxima, so we never report the flank of a hump.
+    if (!(mag[k] >= mag[k - 1] && mag[k] >= mag[k + 1])) continue;
+    const ratio = mag[k] / (base[k] + 1e-12);
+    if (ratio > bestRatio) { bestRatio = ratio; best = k; }
+  }
+  if (best < 1 || best >= n - 1) return null;
+
+  const eps = 1e-12;
+  const a = Math.log(mag[best - 1] + eps);
+  const b = Math.log(mag[best] + eps);
+  const c = Math.log(mag[best + 1] + eps);
+  const denom = a - 2 * b + c;
+  const delta = denom === 0 ? 0 : (0.5 * (a - c)) / denom;
+  const refined = best + Math.max(-0.5, Math.min(0.5, delta));
+
+  return {
+    bin: refined,
+    cyclesPerSample: refined / nfft,
+    magnitude: mag[best],
+    prominence: bestRatio,
+  };
+}
+
+/** Complex spectrum of a real signal, zero-padded. Returns { re, im, nfft }. */
+export function spectrumComplex(x) {
+  const nfft = nextPow2(x.length);
+  const re = new Float64Array(nfft);
+  const im = new Float64Array(nfft);
+  re.set(x);
+  fft(re, im);
+  return { re, im, nfft };
+}
+
+/**
+ * CROSS-STRIP PHASE COHERENCE, which is the discriminator that makes a single
+ * frame usable at low cycle counts.
+ *
+ * The problem this solves: at 1080 rows and a typical row time, a 120 Hz mains
+ * lamp completes only about three and a half cycles across the whole frame.
+ * That is barely enough to call periodic, and a single hard edge in the scene
+ * (a wall meeting a ceiling) carries broadband energy that can out-score it.
+ * Measured on the first real build, exactly that happened: a 120 Hz source was
+ * reported as 71.7 Hz because the picker preferred the edge.
+ *
+ * The way out is physical rather than numerical. Illumination flicker is a
+ * GLOBAL property of the frame: every column is lit by the same lamp, so the
+ * banding has the same phase everywhere across the width. Scene structure is
+ * LOCAL: an edge occupies some columns and not others, and its phase varies
+ * across the width or is absent entirely.
+ *
+ * So: split the frame into K vertical strips, transform each strip's own row
+ * profile, and at every candidate bin measure how well the K complex values
+ * agree in phase. This is the phase-locking value, |sum(Z)| / sum(|Z|), which
+ * is 1 when all strips agree exactly and falls toward 1/sqrt(K) for
+ * independent phases.
+ *
+ * A candidate now has to be BOTH prominent above its local baseline AND
+ * coherent across the frame's width. An edge fails the second test even when
+ * it wins the first.
+ */
+export function coherence(strips, bin) {
+  const k = Math.round(bin);
+  let sumRe = 0, sumIm = 0, sumMag = 0;
+  for (const s of strips) {
+    if (k >= s.re.length) return 0;
+    const re = s.re[k], im = s.im[k];
+    sumRe += re; sumIm += im;
+    sumMag += Math.hypot(re, im);
+  }
+  if (sumMag <= 0) return 0;
+  return Math.hypot(sumRe, sumIm) / sumMag;
+}
+
+/**
+ * Find the line that is both prominent and coherent across the frame width.
+ *
+ * `profiles` is an array of K per-strip row profiles, already the same length.
+ * Returns the winning candidate with both scores attached, or null.
+ */
+export function coherentPeak(profiles, { loBin = 3, baselineHalfWidth = 24, detrendWin = 401, minCoherence = 0.75 } = {}) {
+  if (!profiles?.length) return null;
+
+  const strips = profiles.map((p) => spectrumComplex(hann(detrend(p, detrendWin))));
+  const nfft = strips[0].nfft;
+  const half = nfft >> 1;
+
+  // The full-width profile is the mean of the strips, and it is what we score
+  // prominence on, because averaging is what buys the signal-to-noise.
+  const mean = new Float64Array(half);
+  for (let k = 0; k < half; k++) {
+    let acc = 0;
+    for (const s of strips) acc += Math.hypot(s.re[k], s.im[k]);
+    mean[k] = acc / strips.length;
+  }
+
+  const base = localBaseline(mean, baselineHalfWidth);
+
+  let best = null;
+  for (let k = loBin; k < half - 1; k++) {
+    if (!(mean[k] >= mean[k - 1] && mean[k] >= mean[k + 1])) continue;
+    const prom = mean[k] / (base[k] + 1e-12);
+    if (prom < 2) continue;
+    const coh = coherence(strips, k);
+    if (coh < minCoherence) continue;
+    const score = prom * coh;
+    if (!best || score > best.score) best = { k, prom, coh, score };
+  }
+  if (!best) return null;
+
+  const eps = 1e-12;
+  const a = Math.log(mean[best.k - 1] + eps);
+  const b = Math.log(mean[best.k] + eps);
+  const c = Math.log(mean[best.k + 1] + eps);
+  const denom = a - 2 * b + c;
+  const delta = denom === 0 ? 0 : (0.5 * (a - c)) / denom;
+  const refined = best.k + Math.max(-0.5, Math.min(0.5, delta));
+
+  return {
+    bin: refined,
+    cyclesPerSample: refined / nfft,
+    prominence: best.prom,
+    coherence: best.coh,
+    score: best.score,
+    strips: strips.length,
+  };
+}
+
+/**
+ * How many cycles of a given frequency fit in the record.
+ *
+ * Published beside every reading, because it is the honest statement of how
+ * much the instrument actually saw. Below about four cycles a periodogram
+ * estimate is weakly determined no matter how clean the arithmetic is, and a
+ * reading that does not disclose this is overclaiming.
+ */
+export function cyclesInRecord(cyclesPerSample, nSamples) {
+  return cyclesPerSample * nSamples;
+}
+
+/**
+ * Choose a detrend window from the LOWEST frequency we intend to keep.
+ *
+ * Getting this backwards is how the first build of this instrument deleted its
+ * own signal. A moving-average high-pass has its corner near one over the
+ * window length, so a 65-row window rejects everything below about 1/65
+ * cycles per row. A 120 Hz lamp at roughly 27 microseconds per row bands at
+ * about 3.2e-3 cycles per row, which is a factor of five BELOW that corner.
+ * The filter was sitting on top of the thing it was supposed to pass.
+ *
+ * The window must span several periods of the slowest signal of interest.
+ */
+export function detrendWindowFor(lowestCyclesPerRow, periods = 4) {
+  if (!(lowestCyclesPerRow > 0)) throw new Error('detrendWindowFor: need a positive cycles/row');
+  const period = 1 / lowestCyclesPerRow;
+  const win = Math.round(period * periods);
+  return Math.max(3, win | 1); // odd, so the moving average is centred
+}
+
+/**
+ * The whole pipeline for one profile: detrend, window, transform, pick the peak.
+ *
+ * `detrendWin` defaults to 401 rows, which passes everything above roughly
+ * 2.5e-3 cycles per row and therefore keeps mains flicker on a 1080-row frame,
+ * while still removing gross scene gradient and vignetting.
+ */
+export function analyseProfile(profile, { detrendWin = 401, loBin = 3, baselineHalfWidth = 24 } = {}) {
   if (!profile || profile.length < 32) return null;
   const d = hann(detrend(profile, detrendWin));
   const { mag, nfft } = spectrum(d);
-  return dominantPeak(mag, nfft, loBin);
+  return prominentPeak(mag, nfft, { loBin, baselineHalfWidth });
+}
+
+/**
+ * Cross-frame agreement, which is the discriminator that actually works.
+ *
+ * Mains flicker is stationary: the same line appears frame after frame in the
+ * same place. Scene content is not, because the camera shakes, the subject
+ * moves, and auto-gain breathes. So a reading earns trust by REPEATING, and a
+ * single frame never earns it at all.
+ *
+ * Reports the median estimate and the spread as a percentage of it.
+ */
+export class PeakTracker {
+  constructor(depth = 12) {
+    this.depth = depth;
+    this.samples = [];
+  }
+
+  push(cyclesPerSample) {
+    if (!(cyclesPerSample > 0)) return;
+    this.samples.push(cyclesPerSample);
+    if (this.samples.length > this.depth) this.samples.shift();
+  }
+
+  reset() { this.samples = []; }
+
+  /** { median, spreadPct, n, stable } or null while still filling. */
+  verdict({ minSamples = 6, maxSpreadPct = 2 } = {}) {
+    const n = this.samples.length;
+    if (n < minSamples) return null;
+    const s = [...this.samples].sort((a, b) => a - b);
+    const median = s[n >> 1];
+    // Interquartile spread, so one bad frame does not veto a good run.
+    const q1 = s[Math.floor(n * 0.25)];
+    const q3 = s[Math.floor(n * 0.75)];
+    const spreadPct = median > 0 ? ((q3 - q1) / median) * 100 : Infinity;
+    return { median, spreadPct, n, stable: spreadPct <= maxSpreadPct };
+  }
 }
 
 /**
