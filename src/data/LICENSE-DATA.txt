@@ -1,0 +1,23 @@
+The six .txt recordings in this directory are NOT covered by the repository's
+MIT licence. They are copied verbatim from:
+
+  PADS: Parkinson's Disease Smartwatch dataset, version 1.0.0
+  PhysioNet, published 2024-03-25
+  https://physionet.org/content/parkinsons-disease-smartwatch/1.0.0/
+
+  Varghese J, Brenner A, Fujarski M, van Alen C, Plagwitz L, Warnecke T.
+  Machine Learning in the Parkinson's disease smartwatch (PADS) dataset.
+  npj Parkinsons Disease, 2024.
+
+Licence: Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+  https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+They are redistributed here under that licence, with attribution, for a
+non-commercial student project, and any derivative of them carries the same
+terms. They are included rather than fetched at runtime so that the live page
+works with no network call and so a reader can verify our numbers against the
+original files without downloading the full 469-participant corpus.
+
+These are recordings of real people with real diagnoses. Nothing in this
+directory is synthetic, and nothing in this project infers a diagnosis: the
+condition labels come from the dataset and are reproduced, never predicted.

@@ -1,0 +1,81 @@
+{
+  "source": "PADS: Parkinson's Disease Smartwatch dataset v1.0.0, PhysioNet",
+  "url": "https://physionet.org/content/parkinsons-disease-smartwatch/1.0.0/",
+  "citation": "Varghese J, Brenner A, Fujarski M, van Alen C, Plagwitz L, Warnecke T. Machine Learning in the Parkinson's disease smartwatch (PADS) dataset. npj Parkinsons Dis. 2024.",
+  "license": "CC BY-NC-SA 4.0",
+  "note": "Six recordings copied verbatim from PADS so this page needs no network. Every figure the page shows is computed in your browser from these files. Nothing here is synthetic.",
+  "records": [
+    {
+      "file": "006_StretchHold_RightWrist.txt",
+      "subject": "006",
+      "task": "StretchHold",
+      "wrist": "right",
+      "condition": "Parkinson's",
+      "age": 72,
+      "gender": "female",
+      "handedness": "right",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    },
+    {
+      "file": "006_StretchHold_LeftWrist.txt",
+      "subject": "006",
+      "task": "StretchHold",
+      "wrist": "left",
+      "condition": "Parkinson's",
+      "age": 72,
+      "gender": "female",
+      "handedness": "right",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    },
+    {
+      "file": "009_Relaxed_LeftWrist.txt",
+      "subject": "009",
+      "task": "Relaxed",
+      "wrist": "left",
+      "condition": "Parkinson's",
+      "age": 47,
+      "gender": "male",
+      "handedness": "left",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    },
+    {
+      "file": "005_Relaxed_LeftWrist.txt",
+      "subject": "005",
+      "task": "Relaxed",
+      "wrist": "left",
+      "condition": "Parkinson's",
+      "age": 75,
+      "gender": "male",
+      "handedness": "left",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    },
+    {
+      "file": "001_StretchHold_RightWrist.txt",
+      "subject": "001",
+      "task": "StretchHold",
+      "wrist": "right",
+      "condition": "Healthy",
+      "age": 56,
+      "gender": "male",
+      "handedness": "right",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    },
+    {
+      "file": "003_StretchHold_RightWrist.txt",
+      "subject": "003",
+      "task": "StretchHold",
+      "wrist": "right",
+      "condition": "Healthy",
+      "age": 45,
+      "gender": "female",
+      "handedness": "right",
+      "samplingRateHz": 100,
+      "device": "Apple Watch Series 4"
+    }
+  ]
+}
