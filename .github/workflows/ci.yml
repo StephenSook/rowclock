@@ -1,0 +1,63 @@
+name: CI and Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test the numerical core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # There is nothing to install. The instrument is dependency-free by
+      # design, so there is no lockfile to audit and no supply chain to break.
+
+      - name: Run tests
+        run: node --test tests/*.test.mjs
+
+      # A suite that silently collects nothing still exits zero and still
+      # prints a green check. That is the same class of false green this
+      # project has already hit three times in its own measurements, so the
+      # check asserts that a known number of tests actually EXECUTED.
+      - name: Assert the suite actually ran
+        run: |
+          node --test tests/*.test.mjs > /tmp/out.txt 2>&1 || true
+          PASS=$(grep -E '^# pass ' /tmp/out.txt | awk '{print $3}')
+          FAIL=$(grep -E '^# fail ' /tmp/out.txt | awk '{print $3}')
+          echo "pass=$PASS fail=$FAIL"
+          test -n "$PASS"
+          test "$FAIL" = "0"
+          test "$PASS" -ge 40
+
+  deploy:
+    name: Publish the instrument to Pages
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: src
+      - id: deployment
+        uses: actions/deploy-pages@v4
